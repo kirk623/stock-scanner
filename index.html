@@ -2,6 +2,7 @@
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=Barlow:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/barcode-detector@3.2.3/dist/iife/ponyfill.js"></script>
 <style>
   /* Layout: one narrow column built for a phone held in one hand; scan button first, result card below. */
   :root {
@@ -65,12 +66,19 @@
   #cam { position: fixed; inset: 0; z-index: 20; background: #000; display: flex; flex-direction: column; justify-content: center;
     padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px); }
   #cam[hidden] { display: none !important; }
-  #live { width: 100%; }
-  #live video { width: 100% !important; height: auto !important; }
-  .cam-hint { color: #fff; text-align: center; font: 500 16px var(--body); margin: 14px 0; }
-  #camClose { position: absolute; right: calc(16px + env(safe-area-inset-right, 0px)); bottom: calc(24px + env(safe-area-inset-bottom, 0px));
-    left: calc(16px + env(safe-area-inset-left, 0px)); padding: 16px; border: 0; border-radius: 12px; background: #fff; color: #000;
-    font: 700 20px var(--display); letter-spacing: .06em; text-transform: uppercase; cursor: pointer; }
+  .viewport { position: relative; width: 100%; aspect-ratio: 3 / 4; max-height: 70vh; overflow: hidden; }
+  #video { width: 100%; height: 100%; object-fit: cover; display: block; }
+  /* The scan box marks the area that is decoded: 80% wide, 30% tall, centred. */
+  .box { position: absolute; left: 10%; right: 10%; top: 35%; height: 30%; border: 3px solid #fff; border-radius: 10px;
+    box-shadow: 0 0 0 100vmax rgba(0,0,0,.45); }
+  .box.hit { border-color: #7cc48a; }
+  .cam-hint { color: #fff; text-align: center; font: 500 16px var(--body); margin: 14px 16px; }
+  .cam-ctl { position: absolute; left: calc(16px + env(safe-area-inset-left, 0px)); right: calc(16px + env(safe-area-inset-right, 0px));
+    bottom: calc(24px + env(safe-area-inset-bottom, 0px)); display: flex; gap: 10px; }
+  .cam-ctl button { flex: 1; padding: 16px 8px; border: 0; border-radius: 12px; background: #3a3b33; color: #fff; cursor: pointer;
+    font: 700 18px var(--display); letter-spacing: .06em; text-transform: uppercase; }
+  .cam-ctl button.on { background: #f5d76e; color: #000; }
+  #camClose { background: #fff; color: #000; }
 </style>
 
 <main>
@@ -94,9 +102,16 @@
 </main>
 
 <div id="cam" hidden>
-  <div id="live"></div>
-  <p class="cam-hint">Hold the barcode inside the box</p>
-  <button id="camClose" type="button">Close</button>
+  <div class="viewport">
+    <video id="video" playsinline muted autoplay></video>
+    <div class="box"></div>
+  </div>
+  <p class="cam-hint" id="camHint">Hold the barcode inside the box</p>
+  <div class="cam-ctl">
+    <button id="zoomBtn" type="button" hidden>Zoom 1×</button>
+    <button id="torchBtn" type="button" hidden>Light</button>
+    <button id="camClose" type="button">Close</button>
+  </div>
 </div>
 
 <script>
@@ -193,30 +208,134 @@ function makeDecoder(el) {
 let decoder = null;
 const getDecoder = () => decoder || (decoder = makeDecoder('reader'));
 
-let live = null, photoMode = !(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+// Live scanning, tuned for iPhone:
+// - 1080p video instead of the library default, so thin 1D bars stay sharp;
+// - on Pro iPhones, the multi-lens "Dual Wide"/"Triple" camera, which switches to macro up close
+//   (the plain back lens cannot focus nearer than ~15-20 cm);
+// - zoom where the camera allows it, so the barcode fills the box from a distance the lens can focus at;
+// - zxing-cpp (WebAssembly) decoding only the scan box, which is far faster than the JS decoder.
+const FORMATS = ['ean_13', 'upc_a', 'upc_e', 'ean_8', 'code_128', 'code_39', 'qr_code'];
+const Detector = ('BarcodeDetector' in window) ? window.BarcodeDetector
+  : (window.BarcodeDetectionAPI && BarcodeDetectionAPI.BarcodeDetector);
+let detector = null, stream = null, track = null, running = false, zoomLevels = [], zoomIdx = 0, torchOn = false;
+let photoMode = !(navigator.mediaDevices && navigator.mediaDevices.getUserMedia) || !Detector;
+const video = $('video'), crop = document.createElement('canvas'), cropCtx = crop.getContext('2d', { willReadFrequently: true });
+
 $('scanBtn').addEventListener('click', () => photoMode ? $('photo').click() : startLive());
 $('camClose').addEventListener('click', () => stopLive());
+$('zoomBtn').addEventListener('click', () => { zoomIdx = (zoomIdx + 1) % zoomLevels.length; applyZoom(); });
+$('torchBtn').addEventListener('click', async () => {
+  torchOn = !torchOn;
+  try { await track.applyConstraints({ advanced: [{ torch: torchOn }] }); } catch (_) { torchOn = false; }
+  $('torchBtn').classList.toggle('on', torchOn);
+});
+
+function store(k, v) { try { localStorage.setItem(k, v); } catch (_) {} }
+function recall(k) { try { return localStorage.getItem(k); } catch (_) { return null; } }
+
+const HD = { width: { ideal: 1920 }, height: { ideal: 1080 } };
+async function openCamera(deviceId) {
+  const video = deviceId ? { deviceId: { exact: deviceId }, ...HD } : { facingMode: { ideal: 'environment' }, ...HD };
+  return navigator.mediaDevices.getUserMedia({ audio: false, video });
+}
+
+// Device labels are only readable after the first camera grant, so open the default back
+// camera, then switch to the multi-lens one if this phone has it.
+async function bestStream() {
+  const saved = recall('scanner.camera');
+  if (saved) { try { return await openCamera(saved); } catch (_) {} }
+  let s = await openCamera();
+  const cams = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+  const pick = cams.find(d => /triple/i.test(d.label)) || cams.find(d => /dual wide/i.test(d.label));
+  if (pick && pick.deviceId !== s.getVideoTracks()[0].getSettings().deviceId) {
+    try { s.getTracks().forEach(t => t.stop()); s = await openCamera(pick.deviceId); } catch (_) { s = await openCamera(); }
+  }
+  store('scanner.camera', s.getVideoTracks()[0].getSettings().deviceId || '');
+  return s;
+}
 
 async function startLive() {
   setStatus('');
   out.innerHTML = '';
   $('cam').hidden = false;
+  $('camHint').textContent = 'Starting camera…';
   try {
-    live = live || makeDecoder('live');
-    await live.start({ facingMode: 'environment' },
-      { fps: 15, qrbox: (w, h) => ({ width: Math.floor(w * 0.85), height: Math.floor(Math.min(h, w) * 0.45) }) },
-      code => { stopLive(); if (navigator.vibrate) navigator.vibrate(80); $('q').value = code; find(code, 'camera'); },
-      () => {});
+    detector = detector || new Detector({ formats: FORMATS });
+    stream = await bestStream();
+    track = stream.getVideoTracks()[0];
+    video.srcObject = stream;
+    await video.play();
+    setupControls();
+    $('camHint').textContent = 'Hold the barcode inside the box';
+    running = true;
+    scanLoop();
   } catch (err) {
-    $('cam').hidden = true;
+    stopLive();
     photoMode = true;
-    setStatus('Live camera is blocked in this browser. Tap Scan again to take a photo of the barcode.', true);
+    setStatus('Live camera could not start (' + (err.name || err.message) + '). Tap Scan again to take a photo instead.', true);
   }
 }
 
-async function stopLive() {
+function setupControls() {
+  const caps = track.getCapabilities ? track.getCapabilities() : {};
+  const multi = /triple|dual wide/i.test(track.label);
+  try { if ((caps.focusMode || []).includes('continuous')) track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }); } catch (_) {}
+  zoomLevels = [];
+  if (caps.zoom && caps.zoom.max > caps.zoom.min) {
+    // On the multi-lens camera 1 is the ultra-wide view, so 2 is the normal 1× view.
+    const base = multi ? 2 : 1;
+    zoomLevels = [base, base * 1.5, base * 2.5].filter(z => z >= caps.zoom.min && z <= caps.zoom.max);
+    zoomIdx = Math.min(1, zoomLevels.length - 1);
+  }
+  $('zoomBtn').hidden = zoomLevels.length < 2;
+  if (zoomLevels.length) applyZoom();
+  torchOn = false;
+  $('torchBtn').hidden = !caps.torch;
+  $('torchBtn').classList.remove('on');
+}
+
+function applyZoom() {
+  const z = zoomLevels[zoomIdx], base = zoomLevels[0];
+  track.applyConstraints({ advanced: [{ zoom: z }] }).catch(() => {});
+  $('zoomBtn').textContent = 'Zoom ' + (Math.round(z / base * 10) / 10) + '×';
+}
+
+// Decode only what is inside the on-screen box (video is shown with object-fit: cover).
+async function scanLoop() {
+  while (running) {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if (vw && vh) {
+      const el = video.getBoundingClientRect();
+      const scale = Math.max(el.width / vw, el.height / vh);
+      const offX = (vw * scale - el.width) / 2, offY = (vh * scale - el.height) / 2;
+      const sx = (el.width * 0.10 + offX) / scale, sy = (el.height * 0.35 + offY) / scale;
+      const sw = (el.width * 0.80) / scale, sh = (el.height * 0.30) / scale;
+      crop.width = Math.round(sw); crop.height = Math.round(sh);
+      cropCtx.drawImage(video, sx, sy, sw, sh, 0, 0, crop.width, crop.height);
+      try {
+        const found = await detector.detect(crop);
+        if (found.length && running) { onCode(found[0].rawValue); return; }
+      } catch (_) {}
+    }
+    await new Promise(r => requestAnimationFrame(r));
+  }
+}
+
+function onCode(code) {
+  document.querySelector('.box').classList.add('hit');
+  if (navigator.vibrate) navigator.vibrate(80);
+  stopLive();
+  $('q').value = code;
+  find(code, 'camera');
+}
+
+function stopLive() {
+  running = false;
   $('cam').hidden = true;
-  if (live && live.isScanning) { try { await live.stop(); live.clear(); } catch (_) {} }
+  document.querySelector('.box').classList.remove('hit');
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null; track = null;
+  video.srcObject = null;
 }
 
 function shrink(file, max) {
