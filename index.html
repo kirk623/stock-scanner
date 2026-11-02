@@ -148,7 +148,8 @@ function find(code, how) {
 // no-cors means the page cannot read the reply, so it reports "sent", not "saved".
 function logScan(code, list, how) {
   if (!DATA.logUrl) return;
-  const rows = list ? list.map(i => ({ code, sku: DATA.rows[i][1], name: DATA.rows[i][2],
+  // One scan = one unit: when a code matches several items, log only the first (the barcode match).
+  const rows = list ? [list[0]].map(i => ({ code, sku: DATA.rows[i][1], name: DATA.rows[i][2],
     available: DATA.rows[i][3], onHand: DATA.rows[i][4], found: true, how }))
     : [{ code, sku: '', name: '', available: '', onHand: '', found: false, how }];
   rows.forEach(r => fetch(DATA.logUrl, { method: 'POST', mode: 'no-cors', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify(r) })
